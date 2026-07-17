@@ -637,10 +637,13 @@ main { overflow-x:hidden; overflow-y:visible; }
 // 1) google-apps-script/Code.gs 안내대로 구글시트에 백엔드 코드를 배포
 // 2) 배포해서 나온 웹 앱 URL을 webAppUrl 에, Code.gs의 TOKEN과 같은 값을 token 에 입력
 // 둘 다 비워두면 구글시트 동기화 없이 브라우저 저장(localStorage)만 사용합니다.
+// pollIntervalMs: 관리자 화면이 몇 밀리초마다 구글시트를 다시 확인할지 (기본 5000 = 5초).
+//   너무 짧게 하면 구글 계정의 하루 실행시간 한도에 걸릴 수 있으니 3000 이하로는 낮추지 않는 걸 권장합니다.
 // ============================================================
 window.SHEET_SYNC_CONFIG = {
   webAppUrl: "https://script.google.com/macros/s/AKfycbxo6RNsooO8cDnGceibobjRaHRawftWIh5wT6_8xD7aFrn_5pjPYoifWmxeTnm7tdG1iQ/exec",
-  token: "jalna2026gym"
+  token: "jalna2026gym",
+  pollIntervalMs: 5000
 };
 
 
@@ -869,6 +872,8 @@ window.SHEET_SYNC_CONFIG = {
   const cfg = window.SHEET_SYNC_CONFIG || {};
   const URL = cfg.webAppUrl || "";
   const TOKEN = cfg.token || "";
+  // 관리자 화면이 몇 초마다 구글시트를 다시 확인할지 (기본 5초). 필요하면 config에서 조절 가능.
+  const POLL_INTERVAL_MS = Number(cfg.pollIntervalMs) || 5000;
 
   function setStatus(text, state) {
     const el = document.querySelector("#sheetSyncStatus");
@@ -886,6 +891,7 @@ window.SHEET_SYNC_CONFIG = {
   let syncTimer = null;
   let syncing = false;
   let dirty = false;
+  let lastMembersSignature = "";
 
   async function pushToSheet() {
     if (syncing) return;
@@ -901,6 +907,7 @@ window.SHEET_SYNC_CONFIG = {
         body: JSON.stringify({ data })
       });
       dirty = false;
+      lastMembersSignature = JSON.stringify(data.members || []);
       setStatus("구글시트 저장 완료 ✓", "ok");
     } catch (err) {
       console.error("[SheetSync] push failed", err);
@@ -910,14 +917,41 @@ window.SHEET_SYNC_CONFIG = {
     }
   }
 
+  // 관리자 화면에서 등록/수정 창(드로어, 모달 등)이 열려있는 동안에는
+  // 자동으로 화면을 다시 그리지 않습니다. (입력 중인 내용을 방해하지 않기 위함)
+  function anyAdminModalOpen() {
+    const ids = ["drawerBackdrop", "memberDetailBackdrop", "passManageBackdrop", "unpaidCollectionBackdrop", "suspensionBackdrop", "refundBackdrop", "attendanceBackdrop"];
+    return ids.some(function (id) {
+      const el = document.querySelector("#" + id);
+      return el && !el.hidden;
+    });
+  }
+
+  function refreshAdminUI() {
+    const adminView = document.querySelector("#adminView");
+    if (!adminView || adminView.hidden) return; // 관리자 화면을 보고 있지 않으면 다시 그릴 필요 없음
+    if (anyAdminModalOpen()) return; // 등록/수정 중이면 방해하지 않음
+    if (typeof render === "function") render();
+    const salesView = document.querySelector("#salesView");
+    if (salesView && !salesView.hidden && typeof renderSales === "function") renderSales();
+    const refundView = document.querySelector("#refundView");
+    if (refundView && !refundView.hidden && typeof renderRefunds === "function") renderRefunds();
+  }
+
   async function pullFromSheet() {
+    if (syncing) return false;
     setStatus("불러오는 중…", "syncing");
     try {
       const res = await fetch(`${URL}?token=${encodeURIComponent(TOKEN)}`);
       const json = await res.json();
       if (json && json.ok && json.data && Array.isArray(json.data.members)) {
-        MemberStore.importData(json.data);
-        setStatus("구글시트에서 불러옴 ✓", "ok");
+        const signature = JSON.stringify(json.data.members);
+        if (signature !== lastMembersSignature) {
+          MemberStore.importData(json.data);
+          lastMembersSignature = signature;
+          refreshAdminUI();
+        }
+        setStatus("구글시트와 연결됨 ✓", "ok");
         return true;
       }
       if (json && json.ok && !json.data) {
@@ -940,12 +974,12 @@ window.SHEET_SYNC_CONFIG = {
     syncTimer = setTimeout(pushToSheet, 1500);
   }
 
-  // 출석체크(하루 수십 번씩 발생 가능)는 여러 건을 모아서 한 번에 보냅니다.
-  // -> 회원이 많아져도 매번 전체 데이터를 재전송하지 않아 안정적으로 동작합니다.
+  // 출석체크는 짧게(3초) 모아서 보냅니다. 여러 명이 연달아 체크인해도 요청이 너무 잦아지지 않으면서,
+  // 너무 오래 기다리지도 않도록 균형을 맞췄습니다.
   function scheduleAttendanceSync() {
     dirty = true;
     clearTimeout(syncTimer);
-    syncTimer = setTimeout(pushToSheet, 20000);
+    syncTimer = setTimeout(pushToSheet, 3000);
   }
 
   window.addEventListener("members-updated", scheduleSync);
@@ -956,6 +990,18 @@ window.SHEET_SYNC_CONFIG = {
   setInterval(function () {
     if (dirty && !syncing) pushToSheet();
   }, 180000);
+
+  // 화면을 보고 있는 동안(탭이 활성 상태일 때) 주기적으로 구글시트에서 최신 데이터를 확인합니다.
+  // -> 태블릿에서 체크인하면 몇 초 안에 관리자 화면에도 자동으로 반영됩니다.
+  function pollLoop() {
+    setTimeout(async function () {
+      if (document.visibilityState === "visible" && !syncing && !dirty) {
+        await pullFromSheet();
+      }
+      pollLoop();
+    }, POLL_INTERVAL_MS);
+  }
+  pollLoop();
 
   window.SheetSync = { enabled: true, pushToSheet, pullFromSheet };
 
