@@ -634,14 +634,9 @@ main { overflow-x:hidden; overflow-y:visible; }
 
 // ============================================================
 // 구글시트 연동 설정 (여기만 채우면 자동 동기화됩니다)
-// 1) google-apps-script/Code.gs 안내대로 구글시트에 백엔드 코드를 배포
-// 2) 배포해서 나온 웹 앱 URL을 webAppUrl 에, Code.gs의 TOKEN과 같은 값을 token 에 입력
-// 둘 다 비워두면 구글시트 동기화 없이 브라우저 저장(localStorage)만 사용합니다.
-// pollIntervalMs: 관리자 화면이 몇 밀리초마다 구글시트를 다시 확인할지 (기본 5000 = 5초).
-//   너무 짧게 하면 구글 계정의 하루 실행시간 한도에 걸릴 수 있으니 3000 이하로는 낮추지 않는 걸 권장합니다.
 // ============================================================
 window.SHEET_SYNC_CONFIG = {
-  webAppUrl: "https://script.google.com/macros/s/AKfycbxo6RNsooO8cDnGceibobjRaHRawftWIh5wT6_8xD7aFrn_5pjPYoifWmxeTnm7tdG1iQ/exec",
+  webAppUrl: "https://script.google.com/macros/s/AKfycbyW2mZRSiW_r4Qs9-7xli3oWb_3qF4mFkwu9fIna3TxI7xbdMrDoG-iw19s3wVRfVSopg/exec",
   token: "jalna2026gym",
   pollIntervalMs: 5000
 };
@@ -654,6 +649,22 @@ window.SHEET_SYNC_CONFIG = {
   const PRICE_KEY = "jalnagym_product_prices_v1";
   const PRODUCT_KEY = "jalnagym_products_v1";
   const BACKUP_KEY = "jalnagym_backups_v1";
+  const ADMIN_PASSWORD_KEY = "jalnagym_admin_password_v1";
+  const DELETED_KEY = "jalnagym_deleted_ids_v1";
+
+  function getDeletedIds() {
+    try { return JSON.parse(localStorage.getItem(DELETED_KEY) || "[]"); } catch (_) { return []; }
+  }
+  function addDeletedId(id) {
+    const ids = getDeletedIds();
+    if (!ids.includes(id)) { ids.push(id); localStorage.setItem(DELETED_KEY, JSON.stringify(ids)); }
+  }
+  function mergeDeletedIds(incoming) {
+    if (!Array.isArray(incoming) || !incoming.length) return getDeletedIds();
+    const merged = Array.from(new Set(getDeletedIds().concat(incoming)));
+    localStorage.setItem(DELETED_KEY, JSON.stringify(merged));
+    return merged;
+  }
   const defaultPrices = { "1":100000, "3":270000, "6":480000, "12":840000, custom:0 };
   const productTemplates = [
     {id:"1",group:"기본 회원권",name:"1개월 회원권",unit:"months",duration:1,color:"blue",description:"30일 동안 헬스장을 자유롭게 이용합니다.",active:true},
@@ -744,7 +755,7 @@ window.SHEET_SYNC_CONFIG = {
     if (index >= 0) members[index] = { ...members[index], ...normalized }; else members.unshift(normalized);
     save(members); return normalized;
   }
-  function remove(id) { save(load().filter(member => member.id !== id)); }
+  function remove(id) { addDeletedId(id); save(load().filter(member => member.id !== id)); }
   function checkIn(id) {
     const members = load(); const index = members.findIndex(member => member.id === id); if (index < 0) return null;
     const attendance = Array.isArray(members[index].attendance) ? members[index].attendance : [];
@@ -846,16 +857,19 @@ window.SHEET_SYNC_CONFIG = {
   function exportData(){
     const members=load();
     const attendanceRecords=members.flatMap(member=>(member.attendance||[]).filter(record=>record?.checkedAt).map(record=>({memberId:member.id,checkedAt:record.checkedAt})));
-    return {version:3,exportedAt:new Date().toISOString(),members,attendanceRecords,products:getProducts(),productPrices:getProductPrices()};
+    return {version:3,exportedAt:new Date().toISOString(),members,attendanceRecords,products:getProducts(),productPrices:getProductPrices(),adminPassword:localStorage.getItem(ADMIN_PASSWORD_KEY)||null,deletedIds:getDeletedIds()};
   }
   function importData(data){
     if(!data||!Array.isArray(data.members))throw new Error("올바른 백업 파일이 아닙니다.");
-    let members=data.members.map(member=>({...member,attendance:Array.isArray(member.attendance)?member.attendance:[]}));
+    const deletedIds=mergeDeletedIds(data.deletedIds);
+    const deletedSet=new Set(deletedIds);
+    let members=data.members.filter(member=>!deletedSet.has(member.id)).map(member=>({...member,attendance:Array.isArray(member.attendance)?member.attendance:[]}));
     if(Array.isArray(data.attendanceRecords)){
       const attendanceByMember=data.attendanceRecords.reduce((grouped,record)=>{if(record?.memberId&&record?.checkedAt)(grouped[record.memberId]||(grouped[record.memberId]=[])).push({checkedAt:record.checkedAt});return grouped;},{});
       members=members.map(member=>({...member,attendance:attendanceByMember[member.id]||member.attendance}));
     }
     save(members); if(data.productPrices)localStorage.setItem(PRICE_KEY,JSON.stringify(data.productPrices)); if(Array.isArray(data.products))saveProducts(data.products);else localStorage.removeItem(PRODUCT_KEY);
+    if(data.adminPassword)localStorage.setItem(ADMIN_PASSWORD_KEY,data.adminPassword);
   }
   function listBackups(){ try{return JSON.parse(localStorage.getItem(BACKUP_KEY)||"[]");}catch(_){return [];} }
   function createBackup(){ const backups=listBackups(); const backup={id:`b_${Date.now()}`,createdAt:new Date().toISOString(),data:exportData()}; localStorage.setItem(BACKUP_KEY,JSON.stringify([backup,...backups].slice(0,10))); return backup; }
@@ -891,11 +905,14 @@ window.SHEET_SYNC_CONFIG = {
   let syncTimer = null;
   let syncing = false;
   let dirty = false;
+  let localVersion = 0; // 로컬에서 변경이 생길 때마다 올라감 (진행 중인 요청이 낡은 응답인지 판단하는 용도)
+  let applyingRemote = false; // 구글시트에서 받은 데이터를 반영하는 중임을 표시 (에코 방지)
   let lastMembersSignature = "";
 
   async function pushToSheet() {
     if (syncing) return;
     syncing = true;
+    const versionAtStart = localVersion;
     setStatus("동기화 중…", "syncing");
     try {
       const data = MemberStore.exportData();
@@ -906,8 +923,9 @@ window.SHEET_SYNC_CONFIG = {
         headers: { "Content-Type": "text/plain;charset=utf-8" },
         body: JSON.stringify({ data })
       });
-      dirty = false;
       lastMembersSignature = JSON.stringify(data.members || []);
+      // 전송하는 동안 또 다른 변경이 없었을 때만 "완료" 처리 (있었다면 dirty를 유지해 다음에 다시 보냄)
+      if (localVersion === versionAtStart) dirty = false;
       setStatus("구글시트 저장 완료 ✓", "ok");
     } catch (err) {
       console.error("[SheetSync] push failed", err);
@@ -940,14 +958,20 @@ window.SHEET_SYNC_CONFIG = {
 
   async function pullFromSheet() {
     if (syncing) return false;
+    const versionAtStart = localVersion;
     setStatus("불러오는 중…", "syncing");
     try {
       const res = await fetch(`${URL}?token=${encodeURIComponent(TOKEN)}`);
       const json = await res.json();
+      // 응답을 기다리는 동안 로컬에서 변경(등록/수정/삭제 등)이 생겼다면,
+      // 이 응답은 그 변경 이전의 낡은 데이터이므로 무시합니다. (되돌림 방지)
+      if (localVersion !== versionAtStart) return false;
       if (json && json.ok && json.data && Array.isArray(json.data.members)) {
         const signature = JSON.stringify(json.data.members);
         if (signature !== lastMembersSignature) {
+          applyingRemote = true;
           MemberStore.importData(json.data);
+          applyingRemote = false;
           lastMembersSignature = signature;
           refreshAdminUI();
         }
@@ -967,9 +991,16 @@ window.SHEET_SYNC_CONFIG = {
     return false;
   }
 
-  // 실제 등록/수정(회원, 상품)은 조금만 기다렸다가 바로 반영합니다.
-  function scheduleSync() {
+  function bumpLocalVersion() {
+    if (applyingRemote) return; // 구글시트 데이터를 반영하는 중에 생기는 이벤트는 "내 변경"이 아니므로 무시
+    localVersion++;
     dirty = true;
+    return true;
+  }
+
+  // 실제 등록/수정(회원, 상품, 관리자 설정)은 조금만 기다렸다가 바로 반영합니다.
+  function scheduleSync() {
+    if (!bumpLocalVersion()) return;
     clearTimeout(syncTimer);
     syncTimer = setTimeout(pushToSheet, 1500);
   }
@@ -977,13 +1008,14 @@ window.SHEET_SYNC_CONFIG = {
   // 출석체크는 짧게(3초) 모아서 보냅니다. 여러 명이 연달아 체크인해도 요청이 너무 잦아지지 않으면서,
   // 너무 오래 기다리지도 않도록 균형을 맞췄습니다.
   function scheduleAttendanceSync() {
-    dirty = true;
+    if (!bumpLocalVersion()) return;
     clearTimeout(syncTimer);
     syncTimer = setTimeout(pushToSheet, 3000);
   }
 
   window.addEventListener("members-updated", scheduleSync);
   window.addEventListener("products-updated", scheduleSync);
+  window.addEventListener("admin-settings-updated", scheduleSync);
   window.addEventListener("attendance-logged", scheduleAttendanceSync);
 
   // 안전망: 위 이벤트를 놓치더라도 변경사항이 있으면 3분마다 한 번씩은 반드시 동기화합니다.
@@ -993,6 +1025,7 @@ window.SHEET_SYNC_CONFIG = {
 
   // 화면을 보고 있는 동안(탭이 활성 상태일 때) 주기적으로 구글시트에서 최신 데이터를 확인합니다.
   // -> 태블릿에서 체크인하면 몇 초 안에 관리자 화면에도 자동으로 반영됩니다.
+  // 로컬에 아직 반영 안 된 변경(dirty)이 있으면, 먼저 그걸 보내는 게 우선이므로 이번 회차는 건너뜁니다.
   function pollLoop() {
     setTimeout(async function () {
       if (document.visibilityState === "visible" && !syncing && !dirty) {
@@ -1380,6 +1413,7 @@ $("#adminPasswordForm").addEventListener("submit",event=>{
   if(next.length<4){error.textContent="새 비밀번호는 4자리 이상으로 입력해 주세요.";return;}
   if(next!==confirmPassword){error.textContent="새 비밀번호 확인이 일치하지 않습니다.";return;}
   localStorage.setItem(ADMIN_PASSWORD_KEY,next);
+  window.dispatchEvent(new CustomEvent("admin-settings-updated"));
   sessionStorage.removeItem("jalnagym_admin");
   event.currentTarget.reset(); error.textContent=""; $("#adminPassword").value="";
   adminShell.hidden=true; loginLayer.hidden=false;
@@ -1495,14 +1529,14 @@ $("#memberForm").addEventListener("submit",event=>{
     kioskView.hidden = false;
     document.title = "잘나가짐 회원권 확인";
     if (typeof resetPin === "function") resetPin();
-    if (location.hash !== "#kiosk" && location.hash !== "") history.replaceState(null, "", "#kiosk");
+    if (history.replaceState) history.replaceState(null, "", "#kiosk");
   }
 
   function showAdmin() {
     kioskView.hidden = true;
     adminView.hidden = false;
     document.title = "잘나가짐 회원관리";
-    if (location.hash !== "#admin") history.replaceState(null, "", "#admin");
+    if (history.replaceState) history.replaceState(null, "", "#admin");
   }
 
   document.querySelector("#openAdminLink").addEventListener("click", function (e) {
@@ -1515,10 +1549,6 @@ $("#memberForm").addEventListener("submit",event=>{
       e.preventDefault();
       showKiosk();
     });
-  });
-
-  window.addEventListener("hashchange", function () {
-    if (location.hash === "#admin") showAdmin(); else showKiosk();
   });
 
   if (location.hash === "#admin") showAdmin(); else showKiosk();
